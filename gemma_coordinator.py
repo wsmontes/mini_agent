@@ -15,7 +15,8 @@ ARQUITETURA CORRETA:
 """
 
 import json
-from typing import List, Dict, Any
+import re
+from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
 from rich.console import Console
 from rich.panel import Panel
@@ -31,6 +32,101 @@ class GemmaCoordinator:
     Gemma atua como usuário inteligente do Qwen Agent.
     Faz queries sequenciais, analisa resultados, contorna problemas.
     """
+    
+    @staticmethod
+    def _robust_json_parse(content: str, max_retries: int = 2) -> Tuple[Optional[Dict], str]:
+        """
+        Extrai e parseia JSON de forma robusta, com fallbacks.
+        
+        Args:
+            content: Conteúdo que deve conter JSON
+            max_retries: Número de tentativas de limpeza
+            
+        Returns:
+            Tupla (dict_parseado ou None, erro_mensagem)
+        """
+        # Tentar parsear diretamente
+        try:
+            return json.loads(content), ""
+        except json.JSONDecodeError:
+            pass
+        
+        # Extrair JSON de markdown code blocks
+        if "```json" in content:
+            try:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+                return json.loads(json_str), ""
+            except (IndexError, json.JSONDecodeError):
+                pass
+        elif "```" in content:
+            try:
+                json_str = content.split("```")[1].split("```")[0].strip()
+                return json.loads(json_str), ""
+            except (IndexError, json.JSONDecodeError):
+                pass
+        
+        # Buscar por objeto JSON no texto
+        json_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+        matches = re.findall(json_pattern, content, re.DOTALL)
+        
+        for match in matches:
+            try:
+                return json.loads(match), ""
+            except json.JSONDecodeError:
+                continue
+        
+        # Tentar corrigir strings não terminadas
+        for attempt in range(max_retries):
+            try:
+                # Adicionar aspas faltantes
+                fixed = content.strip()
+                if fixed.count('"') % 2 != 0:
+                    fixed += '"'
+                if fixed.count('{') > fixed.count('}'):
+                    fixed += '}' * (fixed.count('{') - fixed.count('}'))
+                
+                return json.loads(fixed), ""
+            except json.JSONDecodeError as e:
+                if attempt == max_retries - 1:
+                    return None, f"JSON parsing failed after {max_retries} attempts: {str(e)}"
+        
+        return None, "Could not extract valid JSON from response"
+    
+    @staticmethod
+    def _extract_fallback_from_text(content: str, expected_fields: List[str]) -> Dict[str, Any]:
+        """
+        Extrai informações do texto quando JSON parsing falha.
+        
+        Args:
+            content: Texto da resposta
+            expected_fields: Campos que deveriam estar no JSON
+            
+        Returns:
+            Dict com campos extraídos do texto
+        """
+        result = {}
+        content_lower = content.lower()
+        
+        if "action" in expected_fields:
+            # Check for complete/query_agent keywords
+            if "complete" in content_lower or "finished" in content_lower or "done" in content_lower:
+                result["action"] = "complete"
+            else:
+                result["action"] = "query_agent"
+        
+        if "query_for_agent" in expected_fields:
+            # Try to extract instruction
+            lines = [l.strip() for l in content.split('\n') if l.strip() and len(l.strip()) > 10]
+            result["query_for_agent"] = lines[0] if lines else "Continue with the task"
+        
+        if "final_answer" in expected_fields:
+            result["final_answer"] = content[:500]  # First 500 chars
+        
+        if "reasoning" in expected_fields:
+            reasoning_match = re.search(r'reason(?:ing)?[:\s]+([^\n]+)', content, re.IGNORECASE)
+            result["reasoning"] = reasoning_match.group(1).strip() if reasoning_match else "Extracted from text"
+        
+        return result
     
     def __init__(
         self,
@@ -148,13 +244,13 @@ IMPORTANT:
             
             content = response.choices[0].message.content.strip()
             
-            # Parse JSON
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
+            # Use robust JSON parsing
+            decision, error = self._robust_json_parse(content)
             
-            decision = json.loads(content)
+            if decision is None:
+                if self.verbose:
+                    console.print(f"[yellow]⚠ JSON parse error: {error}. Using text fallback.[/yellow]")
+                decision = self._extract_fallback_from_text(content, ["action", "reasoning", "query_for_agent", "final_answer"])
             
             if self.verbose:
                 console.print(f"\n[bold yellow]🧠 GEMMA (Iteração {iteration})[/bold yellow]")

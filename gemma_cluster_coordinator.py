@@ -164,14 +164,16 @@ class GemmaClusterCoordinator:
             qwen_agent: Agente Qwen para executar as tools
             gemma_model: Nome do modelo Gemma
             base_url: URL da API do LM Studio
-            temperature: Temperatura para geração
+            temperature: Temperatura para geração (planejador usa isso, executor usa menor)
             max_iterations: Máximo de iterações
             verbose: Se deve imprimir informações detalhadas
         """
         self.cluster_manager = cluster_manager
         self.qwen_agent = qwen_agent
         self.gemma_model = gemma_model
-        self.temperature = temperature
+        # BEST PRACTICE: Temperaturas diferenciadas por função
+        self.planner_temperature = max(temperature, 0.4)  # Planejador mais criativo
+        self.executor_temperature = 0.1  # Executor mais determinístico
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.console = Console() if verbose else None
@@ -181,6 +183,9 @@ class GemmaClusterCoordinator:
             base_url=base_url,
             api_key="not-needed"
         )
+        
+        # BEST PRACTICE: Skill Harvesting - memorizar padrões bem-sucedidos
+        self.successful_patterns = []  # Lista de (task_type, action_sequence, success_rate)
         
         # Histórico da conversa
         self.conversation_history = []
@@ -259,26 +264,45 @@ class GemmaClusterCoordinator:
             ])
             history_context = f"\n\nRECENT PROGRESS:\n{history_text}\n\nBased on what we've done so far, what clusters do we need for the NEXT step?"
         
+        # BEST PRACTICE: Few-shot examples + Pensamento→Ação explícito
         system_prompt = f"""You are an intelligent task classifier. Your job is to identify which category/cluster a task belongs to.
 
 AVAILABLE CLUSTERS:
 {clusters_text}
 
-Given a task, you need to:
-1. Identify which cluster(s) are most relevant FOR THE NEXT STEP
-2. You can select 1-3 clusters (ordered by relevance)
-3. Explain your reasoning briefly
+USE THIS FORMAT:
+Thought: [Analyze what the NEXT step requires]
+Action: [Select clusters needed]
 
-Respond with a JSON object:
+FEW-SHOT EXAMPLES:
+
+Example 1:
+Task: "Search Google for Python creator"
+Thought: Need to open a web browser and navigate to Google's website. This requires web navigation tools.
+Action: {{"clusters": ["WEB"], "reasoning": "Web navigation needed to open Google"}}
+
+Example 2:
+Task: "Calculate the square of 25 and convert to EUR"
+Thought: First need mathematical calculation, then currency conversion. Both are math operations.
+Action: {{"clusters": ["MATH"], "reasoning": "Math operations for calculation and currency conversion"}}
+
+Example 3:
+Task: "Extract data from CSV and search for info online"
+Thought: Need data processing tools first, then web tools for searching.
+Action: {{"clusters": ["DATA", "WEB"], "reasoning": "DATA for CSV processing, WEB for online search"}}
+
+NOW YOUR TURN:
+Given a task, respond with JSON:
 {{
+    "thought": "What does the NEXT step require?",
     "clusters": ["CLUSTER1", "CLUSTER2"],
-    "reasoning": "Brief explanation of why these clusters for the next action"
+    "reasoning": "Brief explanation"
 }}
 
 Important: 
-- Choose clusters that contain the tools needed for the NEXT action
-- If task changes (e.g., from web navigation to calculation), change clusters
-- Be specific - don't select all clusters, only what's needed now"""
+- Choose clusters for the NEXT action only
+- If task changes (web→calculation), change clusters
+- Be specific - max 2-3 clusters"""
 
         user_prompt = f"""Original task: {user_query}{history_context}
 
@@ -291,7 +315,7 @@ Which cluster(s) should be used?"""
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_prompt}
                 ],
-                temperature=self.temperature,
+                temperature=self.planner_temperature,  # Higher temp for planning creativity
                 max_tokens=300
             )
             
@@ -510,7 +534,13 @@ Based on the browser state and results above, what should we do next?"""
             if self.verbose:
                 self.console.print("[bold magenta]📝 Creating subtasks...[/bold magenta]")
             
-            subtasks = self._gemma_create_subtasks(task["description"])
+            # BEST PRACTICE: Verificar se há padrão similar registrado
+            similar_pattern = self._get_similar_pattern(task["description"])
+            
+            if similar_pattern and self.verbose:
+                self.console.print(f"[cyan]💡 Found similar pattern with {len(similar_pattern)} steps[/cyan]")
+            
+            subtasks = self._gemma_create_subtasks(task["description"], hint=similar_pattern)
             task["subtasks"] = subtasks
             
             if self.verbose:
@@ -623,10 +653,17 @@ Based on the browser state and results above, what should we do next?"""
                     if self.verbose:
                         self.console.print("\n[yellow]🤖 Qwen executing...[/yellow]")
                     
+                    # BEST PRACTICE: Set executor temperature low for deterministic tool use
+                    original_temp = self.qwen_agent.temperature
+                    self.qwen_agent.temperature = self.executor_temperature
+                    
                     # Build message with context
                     context = self._build_qwen_context()
                     full_message = f"{context}\n\nInstruction: {instruction}"
                     agent_response = self.qwen_agent.query(full_message)
+                    
+                    # Restore original temperature
+                    self.qwen_agent.temperature = original_temp
                     
                     if self.verbose:
                         self.console.print(Panel(
@@ -801,8 +838,15 @@ Try a DIFFERENT approach or tool."""
             
             if task_achieved:
                 self._update_task_status(task_id, "done")
+                
+                # BEST PRACTICE: Skill Harvesting - Registrar padrão bem-sucedido
+                task_type = self._extract_task_type(task["description"])
+                completed_actions = [st for st in task["subtasks"]]
+                self._record_successful_pattern(task_type, completed_actions)
+                
                 if self.verbose:
                     self.console.print(f"\n[green]✅ Task {task_id} completed![/green]")
+                    self.console.print(f"[dim]💾 Pattern '{task_type}' saved for reuse[/dim]")
             else:
                 self._update_task_status(task_id, "failed")
                 if self.verbose:
@@ -926,16 +970,18 @@ Try a DIFFERENT approach or tool."""
                         self.console.print(f"[green]✓ Loaded {len(relevant_tools)} tools total[/green]")
                         self.console.print(f"[dim]Tools: {', '.join([t.name for t in relevant_tools])}[/dim]\n")
                     
-                    # Recarregar tools no Qwen
-                    self.qwen_agent.tools = {}
+                    # FIX: Use clear_tools() to properly reset both tools dict and schemas
+                    self.qwen_agent.clear_tools()
                     for tool in relevant_tools:
                         self.qwen_agent.register_tool(tool)
                 else:
+                    # OPTIMIZATION: Same clusters, skip re-registration
                     if self.verbose:
-                        self.console.print(f"[dim]✓ Same clusters: {', '.join(selected_clusters)}[/dim]\n")
+                        self.console.print(f"[dim]✓ Same clusters: {', '.join(selected_clusters)} (skipping reload)[/dim]\n")
             else:
                 # Primeira iteração: carregar tools iniciais
-                self.qwen_agent.tools = {}
+                # FIX: Use clear_tools() to ensure clean state
+                self.qwen_agent.clear_tools()
                 for tool in relevant_tools:
                     self.qwen_agent.register_tool(tool)
             
@@ -959,8 +1005,10 @@ Try a DIFFERENT approach or tool."""
                         border_style="green"
                     ))
                 
-                # Restaura tools originais
-                self.qwen_agent.tools = original_tools
+                # FIX: Restore tools properly
+                self.qwen_agent.clear_tools()
+                for tool in original_tools.values():
+                    self.qwen_agent.register_tool(tool)
                 
                 return final_answer
             
@@ -1004,8 +1052,10 @@ Try a DIFFERENT approach or tool."""
         if self.verbose:
             self.console.print("[yellow]⚠ Maximum iterations reached[/yellow]")
         
-        # Restaura tools originais
-        self.qwen_agent.tools = original_tools
+        # FIX: Restore tools properly by re-registering instead of dict assignment
+        self.qwen_agent.clear_tools()
+        for tool in original_tools.values():
+            self.qwen_agent.register_tool(tool)
         
         return "Maximum iterations reached. Task may be incomplete."
     
@@ -1134,6 +1184,92 @@ Try a DIFFERENT approach or tool."""
         
         return "\n\n".join(sections)
     
+    def _record_successful_pattern(self, task_type: str, actions: List[str]):
+        """
+        BEST PRACTICE: Skill Harvesting - Registra padrões de ações bem-sucedidas.
+        Inspirado no Agent-E que memoriza sequências de navegação efetivas.
+        
+        Args:
+            task_type: Tipo de tarefa (ex: "google_search", "form_fill")
+            actions: Lista de ações que levaram ao sucesso
+        """
+        # Procura padrão existente
+        for pattern in self.successful_patterns:
+            if pattern["type"] == task_type:
+                pattern["examples"].append(actions)
+                pattern["count"] += 1
+                return
+        
+        # Novo padrão
+        self.successful_patterns.append({
+            "type": task_type,
+            "examples": [actions],
+            "count": 1
+        })
+        
+        # Manter apenas os 10 padrões mais usados
+        if len(self.successful_patterns) > 10:
+            self.successful_patterns.sort(key=lambda x: x["count"], reverse=True)
+            self.successful_patterns = self.successful_patterns[:10]
+    
+    def _get_similar_pattern(self, task_description: str) -> Optional[List[str]]:
+        """
+        Busca padrão similar registrado para reutilizar.
+        
+        Args:
+            task_description: Descrição da tarefa atual
+            
+        Returns:
+            Lista de ações sugeridas ou None
+        """
+        task_lower = task_description.lower()
+        
+        # Busca por palavras-chave
+        for pattern in self.successful_patterns:
+            if pattern["type"].lower() in task_lower or any(kw in task_lower for kw in pattern["type"].split("_")):
+                if pattern["examples"]:
+                    return pattern["examples"][-1]  # Retorna exemplo mais recente
+        
+        return None
+    
+    def _extract_task_type(self, task_description: str) -> str:
+        """
+        Extrai tipo de tarefa para categorização de padrões.
+        
+        Args:
+            task_description: Descrição da tarefa
+            
+        Returns:
+            String identificando tipo (ex: "web_search", "form_fill", "data_extract")
+        """
+        task_lower = task_description.lower()
+        
+        # Mapeamento de keywords para tipos
+        task_types = {
+            "search": "web_search",
+            "google": "web_search",
+            "find": "web_search",
+            "look for": "web_search",
+            "form": "form_fill",
+            "fill": "form_fill",
+            "submit": "form_fill",
+            "login": "form_login",
+            "extract": "data_extract",
+            "scrape": "data_extract",
+            "get data": "data_extract",
+            "click": "web_navigation",
+            "navigate": "web_navigation",
+            "open": "web_navigation",
+            "calculate": "math_operation",
+            "compute": "math_operation"
+        }
+        
+        for keyword, task_type in task_types.items():
+            if keyword in task_lower:
+                return task_type
+        
+        return "general_task"
+    
     def _get_page_data_for_qwen(self) -> str:
         """
         Extrai dados determinísticos da página atual automaticamente.
@@ -1161,7 +1297,8 @@ Try a DIFFERENT approach or tool."""
             
             data_lines = []
             
-            # Links disponíveis - mostrar estatísticas + amostra
+            # BEST PRACTICE: DOM Distillation - Filtrar apenas elementos interativos relevantes
+            # Inspirado no Agent-E que reduziu DOM para melhorar performance
             try:
                 from selenium.webdriver.common.by import By
                 
@@ -1174,15 +1311,25 @@ Try a DIFFERENT approach or tool."""
                     pass  # Continue mesmo se não encontrar links
                 
                 all_links = driver.find_elements(By.TAG_NAME, "a")
-                
-                # Filtrar links válidos (com texto E href)
+                    
+                # DOM DISTILLATION: Filtrar apenas links válidos e interativos
                 valid_links = []
                 for idx, link in enumerate(all_links):
                     try:
+                        # Pular elementos ocultos ou não interativos
+                        if not link.is_displayed() or not link.is_enabled():
+                            continue
+                        
                         text = link.text.strip()
                         href = link.get_attribute("href")
-                        if text and href and not href.startswith(("javascript:", "#")):
-                            valid_links.append((idx, text, href))
+                        
+                        # Filtros: texto presente, href válido, não navegação JS
+                        if text and href and not href.startswith(("javascript:", "#", "mailto:")):
+                            # Pular links de navegação/footer genéricos
+                            if text.lower() in ["home", "back", "next", "previous", "close"]:
+                                continue
+                                
+                        valid_links.append((idx, text, href))
                     except:
                         continue  # Skip stale elements
                 
@@ -1406,12 +1553,14 @@ Keep tasks high-level. Subtasks will be created later."""
         
         return result
     
-    def _gemma_create_subtasks(self, task_description: str) -> List[str]:
+    def _gemma_create_subtasks(self, task_description: str, hint: Optional[List[str]] = None) -> List[str]:
         """
         STEP 2: Gemma breaks down a task into detailed subtasks.
+        BEST PRACTICE: Usa skill harvesting hint se disponível.
         
         Args:
             task_description: Description of the main task
+            hint: Optional list of similar successful actions to guide planning
             
         Returns:
             List of subtask descriptions
@@ -1419,10 +1568,17 @@ Keep tasks high-level. Subtasks will be created later."""
         browser_state = self._get_context_summary()
         browser_not_started = "BROWSER NOT STARTED" in browser_state
         
+        # Adicionar hint de padrão similar se disponível
+        hint_text = ""
+        if hint:
+            hint_text = f"\n\nSIMILAR SUCCESSFUL PATTERN (use as inspiration):\n"
+            hint_text += "\n".join(f"{i+1}. {action}" for i, action in enumerate(hint[:5]))
+            hint_text += "\n\nYou can adapt this pattern to the current task."
+        
         system_prompt = f"""Break this task into atomic subtasks. Each subtask = ONE tool call.
 
 Task: {task_description}
-Browser: {browser_state}
+Browser: {browser_state}{hint_text}
 
 RULES:
 1. If browser not started, FIRST subtask MUST be: "Open URL https://google.com"

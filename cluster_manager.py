@@ -78,7 +78,9 @@ class ClusterManager:
             if cluster_name not in self.clusters:
                 raise ValueError(f"Cluster '{cluster_name}' não existe. Clusters válidos: {list(self.clusters.keys())}")
             
-            self.clusters[cluster_name].append(tool)
+            # Prevent duplicate registration
+            if not any(t.name == tool_name for t in self.clusters[cluster_name]):
+                self.clusters[cluster_name].append(tool)
             
             if tool_name not in self.tool_to_clusters:
                 self.tool_to_clusters[tool_name] = set()
@@ -87,6 +89,7 @@ class ClusterManager:
     def get_tools_by_clusters(self, cluster_names: List[str]) -> List[BaseTool]:
         """
         Retorna todas as tools de um ou mais clusters (sem duplicatas)
+        Preserves insertion order for deterministic tool lists.
         
         Args:
             cluster_names: Lista de nomes de clusters
@@ -94,19 +97,18 @@ class ClusterManager:
         Returns:
             Lista única de ferramentas dos clusters solicitados
         """
-        tools_set = set()
-        tools_list = []
+        # Use dict to preserve insertion order (Python 3.7+) while deduplicating
+        tools_dict = {}
         
         for cluster_name in cluster_names:
             if cluster_name not in self.clusters:
                 continue
                 
             for tool in self.clusters[cluster_name]:
-                if tool.name not in tools_set:
-                    tools_set.add(tool.name)
-                    tools_list.append(tool)
+                if tool.name not in tools_dict:
+                    tools_dict[tool.name] = tool
         
-        return tools_list
+        return list(tools_dict.values())
     
     def get_all_clusters_info(self) -> Dict[str, Dict]:
         """
@@ -172,6 +174,13 @@ class ClusterManager:
         if cluster_name in ClusterManager.CLUSTER_DEFINITIONS:
             return ClusterManager.CLUSTER_DEFINITIONS[cluster_name]["description"]
         return ""
+    
+    def reset_clusters(self):
+        """Reset all clusters to empty state (useful for testing or reinitializing)"""
+        self.clusters = {
+            cluster: [] for cluster in self.CLUSTER_DEFINITIONS.keys()
+        }
+        self.tool_to_clusters.clear()
 
 
 def create_default_cluster_manager():

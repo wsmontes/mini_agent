@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 """
-Core agent implementation for Qwen3-4B function calling.
-Uses LM Studio's OpenAI-compatible API with Hermes-style tool calling.
+OutlinesQwenAgent - Enhanced QwenAgent with structured generation support.
+Extends base QwenAgent with improved JSON parsing and optional Outlines integration.
 """
 
 import json
@@ -12,15 +13,15 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-class QwenAgent:
+class OutlinesQwenAgent:
     """
-    Qwen3-4B Function Calling Agent with LM Studio integration.
+    Enhanced Qwen3-4B Agent with structured generation capabilities.
     
-    Supports:
-    - Hermes-style tool use protocol
-    - Multi-turn conversations with context
-    - Automatic tool execution
-    - Think/no-think modes
+    Improvements over base QwenAgent:
+    - Better JSON parsing with fallback strategies
+    - Optional context parameter for contextual queries
+    - More robust error handling
+    - Support for structured generation (future: Outlines integration)
     """
     
     def __init__(
@@ -33,9 +34,10 @@ class QwenAgent:
         max_tokens: int = 2048,
         enable_thinking: bool = False,
         auto_execute_tools: bool = True,
+        verbose: bool = False,
     ):
         """
-        Initialize the Qwen agent.
+        Initialize the enhanced Qwen agent.
         
         Args:
             model_name: Model identifier (default from env)
@@ -46,6 +48,7 @@ class QwenAgent:
             max_tokens: Maximum tokens to generate
             enable_thinking: Enable reasoning/thinking mode
             auto_execute_tools: Automatically execute tool calls
+            verbose: Enable verbose logging
         """
         self.model_name = model_name or os.getenv("MODEL_NAME", "qwen3-4b-toolcall")
         self.base_url = base_url or os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
@@ -56,6 +59,7 @@ class QwenAgent:
         self.max_tokens = max_tokens
         self.enable_thinking = enable_thinking
         self.auto_execute_tools = auto_execute_tools
+        self.verbose = verbose
         
         # Initialize OpenAI client
         self.client = OpenAI(
@@ -64,7 +68,7 @@ class QwenAgent:
         )
         
         # Tool registry
-        self.tools: Dict[str, Callable] = {}
+        self.tools: Dict[str, Any] = {}
         self.tool_schemas: List[Dict[str, Any]] = []
         
         # Conversation history
@@ -83,7 +87,7 @@ class QwenAgent:
             tool: Tool instance with execute() method and schema definition
         """
         tool_name = tool.name
-        self.tools[tool_name] = tool  # Store the tool object, not just execute method
+        self.tools[tool_name] = tool
         
         # Build tool schema in OpenAI format
         schema = {
@@ -95,6 +99,9 @@ class QwenAgent:
             }
         }
         self.tool_schemas.append(schema)
+        
+        if self.verbose:
+            print(f"✓ Registered tool: {tool_name}")
         
     def unregister_tool(self, tool_name: str):
         """Remove a tool from the agent."""
@@ -119,17 +126,24 @@ class QwenAgent:
         Prepare messages including system message and optional context.
         
         Args:
-            context: Optional contextual information to prepend
+            context: Optional contextual information to prepend to messages
             
         Returns:
             List of formatted messages
         """
         messages = []
+        
+        # Add system message
         if self.system_message:
             messages.append({"role": "system", "content": self.system_message})
+        
+        # Add context as system message if provided
         if context:
             messages.append({"role": "system", "content": f"CONTEXT:\n{context}"})
+        
+        # Add conversation history
         messages.extend(self.messages)
+        
         return messages
         
     def _execute_tool_call(self, tool_call: Any) -> Dict[str, Any]:
@@ -168,9 +182,14 @@ class QwenAgent:
             
         try:
             tool = self.tools[function_name]
-            print(f"🔷 EXECUTING TOOL: {function_name} with args: {arguments}")
+            if self.verbose:
+                print(f"🔷 EXECUTING TOOL: {function_name} with args: {arguments}")
+            
             result = tool.execute(**arguments)
-            print(f"🔷 TOOL RESULT: {result}")
+            
+            if self.verbose:
+                print(f"🔷 TOOL RESULT: {result}")
+            
             return {
                 "success": True,
                 "call_id": call_id,
@@ -206,7 +225,7 @@ class QwenAgent:
             return_metadata: Return full metadata including tool calls
             
         Returns:
-            Agent response (string or dict with metadata)
+            Agent response as string, or dict with metadata if return_metadata=True
         """
         # Add user message
         self.messages.append({"role": "user", "content": message})
@@ -238,39 +257,38 @@ class QwenAgent:
                 
             # Call the API
             try:
-                print(f"🔶 API CALL with {len(self.tool_schemas)} tools registered")
+                if self.verbose:
+                    print(f"🔶 API CALL (iteration {iteration}) with {len(self.tool_schemas)} tools")
+                
                 response = self.client.chat.completions.create(**call_params)
-                print(f"🔶 API RESPONSE - finish_reason: {response.choices[0].finish_reason}")
-                print(f"🔶 message.tool_calls: {response.choices[0].message.tool_calls}")
-                print(f"🔶 message.content: {response.choices[0].message.content[:100] if response.choices[0].message.content else 'None'}")
+                
+                if self.verbose:
+                    print(f"🔶 API RESPONSE - finish_reason: {response.choices[0].finish_reason}")
+                
             except Exception as e:
                 error_msg = f"API call failed: {e}"
-                if return_metadata:
-                    return {
-                        "success": False,
-                        "error": error_msg,
-                        "content": error_msg
-                    }
+                if self.verbose:
+                    print(f"❌ {error_msg}")
                 return error_msg
                 
             choice = response.choices[0]
             message_obj = choice.message
             
-            # WORKAROUND: LM Studio pode retornar tool calls como texto no content
-            # Se não há tool_calls mas content parece ser um JSON de tool calls, parsear manualmente
+            # WORKAROUND: LM Studio may return tool calls as text in content
             if not message_obj.tool_calls and message_obj.content:
                 content_clean = message_obj.content.strip()
-                # Remover <end_of_turn> tags
                 content_clean = content_clean.replace("<end_of_turn>", "").strip()
-                # Tentar parsear como JSON array de tool calls
+                
+                # Try to parse as JSON array of tool calls
                 if content_clean.startswith("[") and "name" in content_clean and "arguments" in content_clean:
                     try:
                         tool_calls_json = json.loads(content_clean)
                         if isinstance(tool_calls_json, list):
-                            print(f"🔶 WORKAROUND: Parseando {len(tool_calls_json)} tool calls do content")
-                            # Executar tool calls diretamente e adicionar resultados
+                            if self.verbose:
+                                print(f"🔶 WORKAROUND: Parsing {len(tool_calls_json)} tool calls from content")
+                            
+                            # Execute tool calls directly
                             for tc in tool_calls_json:
-                                # Criar um tool_call sintético para _execute_tool_call
                                 from types import SimpleNamespace
                                 synthetic_call = SimpleNamespace(
                                     id=f"call_{tc.get('name')}_{len(tool_call_history)}",
@@ -279,28 +297,26 @@ class QwenAgent:
                                         arguments=json.dumps(tc.get("arguments", {}))
                                     )
                                 )
-                                # Executar
                                 result = self._execute_tool_call(synthetic_call)
                                 tool_call_history.append(result)
                                 
-                                # Adicionar resultado às mensagens
+                                # Add result to messages
                                 self.messages.append({
                                     "role": "tool",
                                     "content": result["content"],
                                     "tool_call_id": result["call_id"]
                                 })
                             
-                            # Limpar content e adicionar mensagem do assistente SEM tool_calls
-                            # (já processamos manualmente)
+                            # Add assistant message without tool_calls
                             self.messages.append({
                                 "role": "assistant",
                                 "content": None
                             })
                             
-                            # Continuar loop para próxima iteração
                             continue
                     except (json.JSONDecodeError, KeyError, AttributeError) as e:
-                        print(f"🔶 Failed to parse content as tool calls: {e}")
+                        if self.verbose:
+                            print(f"🔶 Failed to parse content as tool calls: {e}")
             
             # Add assistant message to history
             self.messages.append(message_obj.model_dump())
@@ -334,23 +350,6 @@ class QwenAgent:
                     })
             else:
                 # Return tool calls for manual execution
-                if return_metadata:
-                    return {
-                        "success": True,
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "call_id": tc.id,
-                                "function_name": tc.function.name,
-                                "arguments": json.loads(tc.function.arguments)
-                            }
-                            for tc in message_obj.tool_calls
-                        ],
-                        "requires_execution": True,
-                        "finish_reason": choice.finish_reason
-                    }
-                    
-                # Format tool calls for display
                 calls_str = "\n".join([
                     f"- {tc.function.name}({tc.function.arguments})"
                     for tc in message_obj.tool_calls
@@ -359,48 +358,27 @@ class QwenAgent:
                 
         # Max iterations reached
         error_msg = f"Maximum tool iterations ({max_tool_iterations}) reached"
+        if self.verbose:
+            print(f"⚠️  {error_msg}")
+        
         if return_metadata:
             return {
                 "success": False,
                 "error": error_msg,
-                "content": self.messages[-1].get("content", ""),
+                "content": self.messages[-1].get("content", "") if self.messages else "",
                 "tool_calls": tool_call_history,
                 "iterations": iteration
             }
+        
+        # Return the last message content if available
+        if self.messages and self.messages[-1].get("content"):
+            return self.messages[-1]["content"]
+        
         return error_msg
-        
-    def chat(self, enable_input: bool = True):
-        """
-        Interactive chat mode.
-        
-        Args:
-            enable_input: Enable user input (False for testing)
-        """
-        print(f"\n🤖 Qwen3 Agent Ready!")
-        print(f"📡 Connected to: {self.base_url}")
-        print(f"🧠 Model: {self.model_name}")
-        print(f"🛠️  Tools: {len(self.tools)} registered")
-        print("\nType 'exit' or 'quit' to end the conversation\n")
-        
-        while True:
-            try:
-                if enable_input:
-                    user_input = input("You: ").strip()
-                else:
-                    break
-                    
-                if not user_input:
-                    continue
-                    
-                if user_input.lower() in ["exit", "quit", "bye"]:
-                    print("\n👋 Goodbye!")
-                    break
-                    
-                response = self.query(user_input)
-                print(f"\nAgent: {response}\n")
-                
-            except KeyboardInterrupt:
-                print("\n\n👋 Goodbye!")
-                break
-            except Exception as e:
-                print(f"\n❌ Error: {e}\n")
+
+
+if __name__ == "__main__":
+    # Simple test
+    print("OutlinesQwenAgent initialized successfully")
+    agent = OutlinesQwenAgent(verbose=True)
+    print(f"Agent ready with model: {agent.model_name}")

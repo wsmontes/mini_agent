@@ -5,12 +5,10 @@ Interactive CLI for chatting with the agent.
 
 from agent import QwenAgent
 from tools import (
-    WeatherTool,
     CurrentWeatherTool,
     ForecastWeatherTool,
     CalculatorTool,
     WebSearchTool,
-    FileReadTool,
     FileListTool
 )
 from rich.console import Console
