@@ -233,6 +233,11 @@ class OutlinesQwenAgent:
         tool_call_history = []
         iteration = 0
         
+        # ANTI-LOOP: Rastrear última tool call para evitar repetições
+        last_tool_signature = None
+        last_tool_success = False
+        repeat_count = 0
+        
         while iteration < max_tool_iterations:
             iteration += 1
             
@@ -287,7 +292,7 @@ class OutlinesQwenAgent:
                             if self.verbose:
                                 print(f"🔶 WORKAROUND: Parsing {len(tool_calls_json)} tool calls from content")
                             
-                            # Execute tool calls directly
+                            # Execute tool calls directly with ANTI-LOOP
                             for tc in tool_calls_json:
                                 from types import SimpleNamespace
                                 synthetic_call = SimpleNamespace(
@@ -297,14 +302,54 @@ class OutlinesQwenAgent:
                                         arguments=json.dumps(tc.get("arguments", {}))
                                     )
                                 )
+                                
+                                # ANTI-LOOP: Verificar repetição
+                                tool_signature = (synthetic_call.function.name, synthetic_call.function.arguments)
+                                
+                                if tool_signature == last_tool_signature and last_tool_success:
+                                    repeat_count += 1
+                                    if repeat_count >= 2:
+                                        if self.verbose:
+                                            print(f"🚫 BLOCKED REPEAT: {synthetic_call.function.name} (workaround path)")
+                                        
+                                        result = {
+                                            "success": True,
+                                            "call_id": synthetic_call.id,
+                                            "function_name": synthetic_call.function.name,
+                                            "content": json.dumps({
+                                                "status": "already_done",
+                                                "note": "Tool already executed. Stop repeating."
+                                            })
+                                        }
+                                        tool_call_history.append(result)
+                                        self.messages.append({
+                                            "role": "tool",
+                                            "content": result["content"],
+                                            "tool_call_id": result["call_id"]
+                                        })
+                                        continue
+                                
                                 result = self._execute_tool_call(synthetic_call)
                                 tool_call_history.append(result)
+                                
+                                # Atualizar tracking
+                                last_tool_signature = tool_signature
+                                last_tool_success = result.get("success", False)
+                                if last_tool_signature != tool_signature:
+                                    repeat_count = 0
                                 
                                 # Add result to messages
                                 self.messages.append({
                                     "role": "tool",
                                     "content": result["content"],
                                     "tool_call_id": result["call_id"]
+                                })
+                            
+                            # Add warning after loop detection
+                            if repeat_count >= 2:
+                                self.messages.append({
+                                    "role": "system",
+                                    "content": "WARNING: You are repeating the same tool calls. The tools already executed successfully. STOP calling tools and provide your final answer now."
                                 })
                             
                             # Add assistant message without tool_calls
@@ -339,8 +384,46 @@ class OutlinesQwenAgent:
             # Execute tool calls if auto-execution is enabled
             if self.auto_execute_tools:
                 for tool_call in message_obj.tool_calls:
+                    # ANTI-LOOP: Verificar se é repetição idêntica
+                    tool_signature = (tool_call.function.name, tool_call.function.arguments)
+                    
+                    if tool_signature == last_tool_signature and last_tool_success:
+                        repeat_count += 1
+                        if repeat_count >= 2:
+                            # Bloquear repetição excessiva
+                            if self.verbose:
+                                print(f"🚫 BLOCKED REPEAT: {tool_call.function.name} called {repeat_count+1} times")
+                            
+                            result = {
+                                "success": True,
+                                "call_id": tool_call.id,
+                                "function_name": tool_call.function.name,
+                                "content": json.dumps({
+                                    "status": "already_done",
+                                    "note": "This tool was already executed successfully. Move to the next step."
+                                })
+                            }
+                            tool_call_history.append(result)
+                            self.messages.append({
+                                "role": "tool",
+                                "content": result["content"],
+                                "tool_call_id": result["call_id"]
+                            })
+                            # Adicionar aviso ao modelo
+                            self.messages.append({
+                                "role": "system",
+                                "content": "WARNING: Do NOT repeat the same tool call. The previous execution was successful. Proceed to the next action or provide the final answer."
+                            })
+                            continue
+                    
                     result = self._execute_tool_call(tool_call)
                     tool_call_history.append(result)
+                    
+                    # Atualizar tracking
+                    last_tool_signature = tool_signature
+                    last_tool_success = result.get("success", False)
+                    if tool_signature != (tool_call.function.name, tool_call.function.arguments):
+                        repeat_count = 0  # Reset se mudou
                     
                     # Add tool result to messages
                     self.messages.append({

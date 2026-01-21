@@ -816,7 +816,11 @@ Try a DIFFERENT approach or tool."""
                         if self.verbose:
                             self.console.print("[yellow]⬆️  Escalating to Gemma: Revising subtasks for this task[/yellow]")
                         # Gemma recria subtasks com contexto de erros
-                        task["subtasks"] = self._gemma_revise_subtasks(task["description"], escalation_decision["error_context"])
+                        task["subtasks"] = self._gemma_revise_subtasks(
+                            task["description"], 
+                            escalation_decision["error_context"],
+                            task["subtasks"]  # Pass old_subtasks
+                        )
                         subtask_index = 0  # Recomeçar do início
                         continue
                     
@@ -1505,12 +1509,23 @@ Try a DIFFERENT approach or tool."""
 
 Your job: Break down the user's request into 2-5 HIGH-LEVEL tasks (not detailed steps).
 
-Example:
+RULES:
+- If the request is simple math/logic, do NOT include web browsing tasks.
+- Never create tasks like "obtain the value of 15" (assume you already have the numbers).
+- Only use web if the task explicitly requires searching or accessing websites.
+
+Example (WEB):
 User: "Search Google for Python creator, find his birth year, calculate his age"
 Tasks:
 1. Navigate to Google and search for Python creator
 2. Find creator's birth year from results
 3. Calculate current age from birth year
+
+Example (MATH):
+User: "Calcule 15 ao quadrado"
+Tasks:
+1. Compute 15 * 15
+2. Present the result
 
 Respond with JSON:
 {
@@ -1565,7 +1580,15 @@ Keep tasks high-level. Subtasks will be created later."""
         Returns:
             List of subtask descriptions
         """
-        browser_state = self._get_context_summary()
+        # Detectar se task realmente precisa de web
+        task_lower = task_description.lower()
+        requires_web = any(kw in task_lower for kw in [
+            "http", "https", "www", "site", "website", "browser", "web",
+            "google", "search", "pesquis", "abrir", "link", "clique", "naveg",
+            "página", "url"
+        ])
+        
+        browser_state = self._get_context_summary() if requires_web else "WEB NOT REQUIRED FOR THIS TASK"
         browser_not_started = "BROWSER NOT STARTED" in browser_state
         
         # Adicionar hint de padrão similar se disponível
@@ -1575,15 +1598,21 @@ Keep tasks high-level. Subtasks will be created later."""
             hint_text += "\n".join(f"{i+1}. {action}" for i, action in enumerate(hint[:5]))
             hint_text += "\n\nYou can adapt this pattern to the current task."
         
+        # Regra condicional para abrir browser
+        browser_rule = ""
+        if requires_web and browser_not_started:
+            browser_rule = "1. Browser is needed but not started. FIRST subtask MUST be: \"Open URL https://www.google.com\"\n"
+        elif not requires_web:
+            browser_rule = "1. This task does NOT require web browsing. Use computational tools directly.\n"
+        
         system_prompt = f"""Break this task into atomic subtasks. Each subtask = ONE tool call.
 
 Task: {task_description}
 Browser: {browser_state}{hint_text}
 
 RULES:
-1. If browser not started, FIRST subtask MUST be: "Open URL https://google.com"
-2. Each subtask = exactly ONE action (never combine)
-3. Logical order: navigate → extract → click → fill
+{browser_rule}2. Each subtask = exactly ONE action (never combine)
+3. Logical order: navigate → extract → click → fill (only if web required)
 4. Be specific: include exact search terms, link text, etc.
 
 Respond with JSON:
@@ -2021,7 +2050,15 @@ Respond with JSON:
         Returns:
             Nova lista de subtasks
         """
-        browser_state = self._get_context_summary()
+        # Detectar se task precisa de web
+        task_lower = task_description.lower()
+        requires_web = any(kw in task_lower for kw in [
+            "http", "https", "www", "site", "website", "browser", "web",
+            "google", "search", "pesquis", "abrir", "link", "clique", "naveg",
+            "página", "url"
+        ])
+        
+        browser_state = self._get_context_summary() if requires_web else "WEB NOT REQUIRED FOR THIS TASK"
         
         # Extract judge verdict from error_context
         judge_verdict = ""
@@ -2029,6 +2066,13 @@ Respond with JSON:
             judge_verdict = error_context.split("EXTERNAL JUDGE ANALYSIS:")[1].strip()
         
         browser_not_started = "BROWSER NOT STARTED" in browser_state
+        
+        # Regra condicional
+        browser_rule = ""
+        if requires_web and browser_not_started:
+            browser_rule = "2. Browser needed but not started. FIRST = \"Open URL https://www.google.com\"\n"
+        elif not requires_web:
+            browser_rule = "2. This task does NOT require web. Use computational tools.\n"
         
         system_prompt = f"""JUDGE'S DIAGNOSIS:
 {judge_verdict[:300]}
@@ -2041,8 +2085,7 @@ OLD SUBTASKS (FAILED):
 
 CREATE NEW SUBTASKS:
 1. MUST be different from old ones
-2. If browser not started, FIRST = "Open URL https://google.com"
-3. Follow judge's recommendations
+{browser_rule}3. Follow judge's recommendations
 4. Each subtask = ONE tool call
 
 Respond with JSON:

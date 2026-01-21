@@ -22,12 +22,27 @@ class ClusterManager:
     CLUSTER_DEFINITIONS = {
         "MATH": {
             "description": "Mathematical operations, calculations, statistics",
-            "keywords": ["calculate", "math", "number", "equation", "compute", "sum", "average", "statistics"],
+            "keywords": [
+                # English
+                "calculate", "math", "number", "equation", "compute", "sum", "average", "statistics",
+                "multiply", "divide", "add", "subtract", "square", "root", "power",
+                # Portuguese
+                "calcule", "calcular", "matemática", "número", "equação", "computar", "soma",
+                "média", "estatística", "multiplicar", "dividir", "adicionar", "subtrair",
+                "quadrado", "raiz", "potência", "ao quadrado", "elevado"
+            ],
             "sub_clusters": ["mathematics", "math", "math/finance"]
         },
         "WEB": {
             "description": "Web browsing, navigation, clicking, form filling",
-            "keywords": ["web", "browser", "click", "navigate", "url", "page", "link", "website"],
+            "keywords": [
+                # English
+                "web", "browser", "click", "navigate", "url", "page", "link", "website",
+                "search", "google", "find", "open",
+                # Portuguese  
+                "navegador", "clicar", "clique", "navegar", "navegação", "página", "site",
+                "pesquisar", "pesquisa", "buscar", "busca", "abrir", "acessar"
+            ],
             "sub_clusters": ["web retrieval", "browser interaction", "web search", "browser", "web form", "web input"]
         },
         "DATA": {
